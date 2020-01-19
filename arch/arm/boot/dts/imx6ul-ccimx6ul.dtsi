@@ -109,11 +109,9 @@
 
 		pwrkey {
 			compatible = "digi,mca-cc6ul-pwrkey";
-			digi,key-power;
-			digi,key-sleep;
-			digi,debounce-ms = <100>;
-			digi,pwroff-delay-sec = <6>;
-			digi,pwroff-guard-sec = <30>;
+			digi,debounce-ms = <255>;
+			digi,pwroff-delay-sec = <255>;
+			digi,pwroff-guard-sec = <255>;
 		};
 
 		mca_adc: adc {
