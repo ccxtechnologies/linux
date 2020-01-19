@@ -134,6 +134,8 @@ static int mca_cc6ul_pwrkey_initialize(struct mca_cc6ul_pwrkey *pwrkey)
 
 	if (pwrkey->key_power)
 		pwrctrl0 |= MCA_CC6UL_PWR_KEY_OFF_EN;
+	else
+		pwrctrl0 |= MCA_CC6UL_PWR_OFF_CANCEL;
 
 	if (pwrkey->key_sleep)
 		pwrctrl0 |= MCA_CC6UL_PWR_KEY_SLEEP_EN;
@@ -141,7 +143,6 @@ static int mca_cc6ul_pwrkey_initialize(struct mca_cc6ul_pwrkey *pwrkey)
 	if (pwrkey->pwroff_guard_sec != 0)
 		pwrctrl0 |= MCA_CC6UL_PWR_GUARD_EN;
 
-	pwrctrl0 |= MCA_CC6UL_PWR_OFF_CANCEL;
 
 	ret = regmap_write(pwrkey->mca->regmap, MCA_CC6UL_PWR_CTRL_0, pwrctrl0);
 	if (ret < 0) {
