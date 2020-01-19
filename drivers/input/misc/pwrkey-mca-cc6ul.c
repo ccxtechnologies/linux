@@ -37,8 +37,11 @@
 #define DEFAULT_PWR_KEY_DELAY		4	/* 4 seconds */
 #define DEFAULT_PWR_KEY_GUARD		25	/* 25 seconds */
 #define MAX_PWR_KEY_DEBOUNCE		255
+#define MAX_PWR_KEY_DEBOUNCE_TB_50MS	(255 * 50)
 #define MAX_PWR_KEY_DELAY		255
 #define MAX_PWR_KEY_GUARD		255
+
+#define MCA_SUPPORTS_DEB_TB_50MS	MCA_MAKE_FW_VER(1, 7)
 
 struct mca_cc6ul_pwrkey {
 	struct mca_cc6ul *mca;
@@ -51,6 +54,7 @@ struct mca_cc6ul_pwrkey {
 	uint32_t debounce_ms;
 	uint32_t pwroff_delay_sec;
 	uint32_t pwroff_guard_sec;
+	bool supports_deb_tb_50ms;
 };
 
 #ifdef CONFIG_PM_SLEEP
@@ -63,6 +67,8 @@ static irqreturn_t mca_cc6ul_pwrkey_power_off_irq_handler(int irq, void *data)
 
 	dev_notice(&pwrkey->input->dev, "Power Button - KEY_POWER\n");
 
+	/* Clear before set to ensure the event is generated */
+	input_report_key(pwrkey->input, KEY_POWER, 0);
 	input_report_key(pwrkey->input, KEY_POWER, 1);
 	input_sync(pwrkey->input);
 
@@ -89,13 +95,22 @@ static int mca_cc6ul_pwrkey_initialize(struct mca_cc6ul_pwrkey *pwrkey)
 {
 	int ret;
 	uint8_t pwrctrl0 = 0;
+	uint8_t debounce_ms;
+
+	if (pwrkey->debounce_ms > 255) {
+		/* Set timebase period to 50ms */
+		pwrctrl0 |= MCA_CC6UL_KEY_DEB_TB_50MS;
+		debounce_ms = (uint8_t)((pwrkey->debounce_ms + 49) / 50);
+	} else {
+		debounce_ms = (uint8_t)pwrkey->debounce_ms;
+	}
 
 	ret = regmap_write(pwrkey->mca->regmap, MCA_CC6UL_PWR_KEY_DEBOUNCE,
-			   (uint8_t)pwrkey->debounce_ms);
+			   debounce_ms);
 	if (ret < 0) {
 		dev_err(pwrkey->mca->dev,
 			"Failed to set debounce time 0x%02x, %d\n",
-			(uint8_t)pwrkey->debounce_ms, ret);
+			debounce_ms, ret);
 		return ret;
 	}
 
@@ -126,6 +141,8 @@ static int mca_cc6ul_pwrkey_initialize(struct mca_cc6ul_pwrkey *pwrkey)
 	if (pwrkey->pwroff_guard_sec != 0)
 		pwrctrl0 |= MCA_CC6UL_PWR_GUARD_EN;
 
+	pwrctrl0 |= MCA_CC6UL_PWR_OFF_CANCEL;
+
 	ret = regmap_write(pwrkey->mca->regmap, MCA_CC6UL_PWR_CTRL_0, pwrctrl0);
 	if (ret < 0) {
 		dev_err(pwrkey->mca->dev,
@@ -140,7 +157,7 @@ static int mca_cc6ul_pwrkey_initialize(struct mca_cc6ul_pwrkey *pwrkey)
 static int of_mca_cc6ul_pwrkey_read_settings(struct device_node *np,
 					     struct mca_cc6ul_pwrkey *pwrkey)
 {
-	uint32_t val;
+	uint32_t val, max_key_deb;
 
 	/* Get driver configuration data from device tree */
 	pwrkey->debounce_ms = DEFAULT_PWR_KEY_DEBOUNCE;
@@ -150,8 +167,11 @@ static int of_mca_cc6ul_pwrkey_read_settings(struct device_node *np,
 	pwrkey->key_power = of_property_read_bool(np, "digi,key-power");
 	pwrkey->key_sleep = of_property_read_bool(np, "digi,key-sleep");
 
+	max_key_deb = pwrkey->supports_deb_tb_50ms ?
+		      MAX_PWR_KEY_DEBOUNCE_TB_50MS : MAX_PWR_KEY_DEBOUNCE;
+
 	if (!of_property_read_u32(np, "digi,debounce-ms", &val)) {
-		if (val <= MAX_PWR_KEY_DEBOUNCE)
+		if (val <= max_key_deb)
 			pwrkey->debounce_ms = val;
 		else
 			dev_warn(pwrkey->mca->dev,
@@ -176,6 +196,52 @@ static int of_mca_cc6ul_pwrkey_read_settings(struct device_node *np,
 
 	return 0;
 }
+
+static ssize_t mca_cancel_pwroff_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	static const char _enabled[] = "enabled";
+
+	/*
+	 * Right now, the feature that allows to cancel an on-going power off
+	 * sequence is always enabled but in future we could make it
+	 * configurable through a devicetree property.
+	 */
+	return sprintf(buf, "%s\n", _enabled);
+}
+
+static ssize_t mca_cancel_pwroff_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct mca_cc6ul_pwrkey *pwrkey = dev_get_drvdata(dev);
+	static const char cancel_pwroff_str[] = "CANCEL PWROFF";
+	int ret;
+
+	if (strncmp(buf, cancel_pwroff_str, sizeof(cancel_pwroff_str) - 1))
+		return -EINVAL;
+
+	ret = regmap_update_bits(pwrkey->mca->regmap, MCA_CC6UL_PWR_CTRL_0,
+				 MCA_CC6UL_PWR_OFF_CANCEL,
+				 MCA_CC6UL_PWR_OFF_CANCEL);
+	if (ret < 0) {
+		dev_err(pwrkey->mca->dev,
+			"Failed to cancel power off sequence (%d)\n", ret);
+		return ret;
+	}
+
+	return count;
+}
+static DEVICE_ATTR(mca_cancel_pwroff, 0644, mca_cancel_pwroff_show,
+					    mca_cancel_pwroff_store);
+static struct attribute *mca_pwrkey_attrs[] = {
+	&dev_attr_mca_cancel_pwroff.attr,
+	NULL
+};
+
+static struct attribute_group mca_pwrkey_attr_group = {
+	.attrs = mca_pwrkey_attrs,
+};
 
 static int mca_cc6ul_pwrkey_probe(struct platform_device *pdev)
 {
@@ -210,6 +276,9 @@ static int mca_cc6ul_pwrkey_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto err_free;
 	}
+
+	if (mca->fw_version >= MCA_SUPPORTS_DEB_TB_50MS)
+		pwrkey->supports_deb_tb_50ms = true;
 
 	platform_set_drvdata(pdev, pwrkey);
 	pwrkey->mca = mca;
@@ -270,8 +339,17 @@ static int mca_cc6ul_pwrkey_probe(struct platform_device *pdev)
 		goto err_irq2;
 	}
 
+	ret = sysfs_create_group(&pdev->dev.kobj, &mca_pwrkey_attr_group);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to create sysfs entries (%d).\n",
+			ret);
+		goto err_unreg_dev;
+	}
+
 	return 0;
 
+err_unreg_dev:
+	input_unregister_device(pwrkey->input);
 err_irq2:
 	if (pwrkey->key_sleep)
 		free_irq(pwrkey->mca->irq_base + pwrkey->irq_sleep, pwrkey);
@@ -290,6 +368,7 @@ static int mca_cc6ul_pwrkey_remove(struct platform_device *pdev)
 {
 	struct mca_cc6ul_pwrkey *pwrkey = platform_get_drvdata(pdev);
 
+	sysfs_remove_group(&pdev->dev.kobj, &mca_pwrkey_attr_group);
 	if (pwrkey->key_power)
 		free_irq(pwrkey->irq_power, pwrkey);
 	if (pwrkey->key_sleep)
