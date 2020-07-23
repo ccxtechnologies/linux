@@ -17,7 +17,6 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
-#include <linux/spi/spi_bitbang.h>
 #include <linux/types.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -72,6 +71,7 @@ struct spi_imx_devtype_data {
 	void (*reset)(struct spi_imx_data *);
 	void (*setup_wml)(struct spi_imx_data *);
 	void (*disable)(struct spi_imx_data *);
+	int (*wait_on_transaction)(struct spi_imx_data *);
 	bool has_dmamode;
 	bool has_slavemode;
 	unsigned int fifo_size;
@@ -80,7 +80,7 @@ struct spi_imx_devtype_data {
 };
 
 struct spi_imx_data {
-	struct spi_bitbang bitbang;
+	struct spi_master *master;
 	struct device *dev;
 
 	struct completion xfer_done;
@@ -656,6 +656,19 @@ static void mx51_ecspi_reset(struct spi_imx_data *spi_imx)
 		readl(spi_imx->base + MXC_CSPIRXDATA);
 }
 
+static int mx51_wait_on_transaction(struct spi_imx_data *spi_imx)
+{
+	int i;
+
+	for(i = 0; i < 10000; i++) {
+		if(!(readl(spi_imx->base + MX51_ECSPI_CTRL)
+		     & MX51_ECSPI_CTRL_XCH)) {
+			return 0;
+		}
+	}
+	return -ETIMEDOUT;
+}
+
 #define MX31_INTREG_TEEN	(1 << 0)
 #define MX31_INTREG_RREN	(1 << 3)
 
@@ -935,6 +948,7 @@ static struct spi_imx_devtype_data imx1_cspi_devtype_data = {
 	.trigger = mx1_trigger,
 	.rx_available = mx1_rx_available,
 	.reset = mx1_reset,
+	.wait_on_transaction = NULL,
 	.fifo_size = 8,
 	.has_dmamode = false,
 	.dynamic_burst = false,
@@ -949,6 +963,7 @@ static struct spi_imx_devtype_data imx21_cspi_devtype_data = {
 	.trigger = mx21_trigger,
 	.rx_available = mx21_rx_available,
 	.reset = mx21_reset,
+	.wait_on_transaction = NULL,
 	.fifo_size = 8,
 	.has_dmamode = false,
 	.dynamic_burst = false,
@@ -964,6 +979,7 @@ static struct spi_imx_devtype_data imx27_cspi_devtype_data = {
 	.trigger = mx21_trigger,
 	.rx_available = mx21_rx_available,
 	.reset = mx21_reset,
+	.wait_on_transaction = NULL,
 	.fifo_size = 8,
 	.has_dmamode = false,
 	.dynamic_burst = false,
@@ -978,6 +994,7 @@ static struct spi_imx_devtype_data imx31_cspi_devtype_data = {
 	.trigger = mx31_trigger,
 	.rx_available = mx31_rx_available,
 	.reset = mx31_reset,
+	.wait_on_transaction = NULL,
 	.fifo_size = 8,
 	.has_dmamode = false,
 	.dynamic_burst = false,
@@ -993,6 +1010,7 @@ static struct spi_imx_devtype_data imx35_cspi_devtype_data = {
 	.trigger = mx31_trigger,
 	.rx_available = mx31_rx_available,
 	.reset = mx31_reset,
+	.wait_on_transaction = NULL,
 	.fifo_size = 8,
 	.has_dmamode = true,
 	.dynamic_burst = false,
@@ -1007,6 +1025,7 @@ static struct spi_imx_devtype_data imx51_ecspi_devtype_data = {
 	.trigger = mx51_ecspi_trigger,
 	.rx_available = mx51_ecspi_rx_available,
 	.reset = mx51_ecspi_reset,
+	.wait_on_transaction = mx51_wait_on_transaction,
 	.setup_wml = mx51_setup_wml,
 	.fifo_size = 64,
 	.has_dmamode = true,
@@ -1023,6 +1042,7 @@ static struct spi_imx_devtype_data imx53_ecspi_devtype_data = {
 	.trigger = mx51_ecspi_trigger,
 	.rx_available = mx51_ecspi_rx_available,
 	.reset = mx51_ecspi_reset,
+	.wait_on_transaction = mx51_wait_on_transaction,
 	.fifo_size = 64,
 	.has_dmamode = true,
 	.has_slavemode = true,
@@ -1089,18 +1109,18 @@ static const struct of_device_id spi_imx_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, spi_imx_dt_ids);
 
-static void spi_imx_chipselect(struct spi_device *spi, int is_active)
+static void spi_imx_set_cs(struct spi_device *spi, bool enable)
 {
-	int active = is_active != BITBANG_CS_INACTIVE;
-	int dev_is_lowactive = !(spi->mode & SPI_CS_HIGH);
-
 	if (spi->mode & SPI_NO_CS)
 		return;
+
+	if (spi->mode & SPI_CS_HIGH)
+		enable = !enable;
 
 	if (!gpio_is_valid(spi->cs_gpio))
 		return;
 
-	gpio_set_value(spi->cs_gpio, dev_is_lowactive ^ active);
+	gpio_set_value(spi->cs_gpio, !enable);
 }
 
 static void spi_imx_set_burst_len(struct spi_imx_data *spi_imx, int n_bits)
@@ -1270,7 +1290,7 @@ static int spi_imx_setupxfer(struct spi_device *spi,
 		spi_imx->dynamic_burst = 0;
 	}
 
-	if (spi_imx_can_dma(spi_imx->bitbang.master, spi, t))
+	if (spi_imx_can_dma(spi_imx->master, spi, t))
 		spi_imx->usedma = 1;
 	else
 		spi_imx->usedma = 0;
@@ -1288,7 +1308,7 @@ static int spi_imx_setupxfer(struct spi_device *spi,
 
 static void spi_imx_sdma_exit(struct spi_imx_data *spi_imx)
 {
-	struct spi_master *master = spi_imx->bitbang.master;
+	struct spi_master *master = spi_imx->master;
 
 	if (master->dma_rx) {
 		dma_release_channel(master->dma_rx);
@@ -1330,8 +1350,7 @@ static int spi_imx_sdma_init(struct device *dev, struct spi_imx_data *spi_imx,
 	init_completion(&spi_imx->dma_tx_completion);
 	master->can_dma = spi_imx_can_dma;
 	master->max_dma_len = MAX_SDMA_BD_BYTES;
-	spi_imx->bitbang.master->flags = SPI_MASTER_MUST_RX |
-					 SPI_MASTER_MUST_TX;
+	spi_imx->master->flags = SPI_MASTER_MUST_RX | SPI_MASTER_MUST_TX;
 
 	return 0;
 err:
@@ -1373,7 +1392,7 @@ static int spi_imx_dma_transfer(struct spi_imx_data *spi_imx,
 	struct dma_async_tx_descriptor *desc_tx, *desc_rx;
 	unsigned long transfer_timeout;
 	unsigned long timeout;
-	struct spi_master *master = spi_imx->bitbang.master;
+	struct spi_master *master = spi_imx->master;
 	struct sg_table *tx = &transfer->tx_sg, *rx = &transfer->rx_sg;
 	struct scatterlist *last_sg = sg_last(rx->sgl, rx->nents);
 	unsigned int bytes_per_word, i;
@@ -1463,12 +1482,41 @@ static int spi_imx_pio_transfer(struct spi_device *spi,
 	struct spi_imx_data *spi_imx = spi_master_get_devdata(spi->master);
 	unsigned long transfer_timeout;
 	unsigned long timeout;
+	int timedout;
 
 	spi_imx->tx_buf = transfer->tx_buf;
 	spi_imx->rx_buf = transfer->rx_buf;
 	spi_imx->count = transfer->len;
 	spi_imx->txfifo = 0;
 	spi_imx->remainder = 0;
+
+	if(spi_imx->devtype_data->wait_on_transaction) {
+		spi_imx_push(spi_imx);
+		timedout = spi_imx->devtype_data->wait_on_transaction(spi_imx);
+		if (timedout != 0) {
+			dev_err(&spi->dev, "I/O Error in PIO\n");
+			spi_imx->devtype_data->reset(spi_imx);
+			return -ETIMEDOUT;
+		}
+
+		while(spi_imx->txfifo) {
+			while (spi_imx->devtype_data->rx_available(spi_imx)) {
+				spi_imx->rx(spi_imx);
+				spi_imx->txfifo--;
+			}
+
+			if (spi_imx->count) {
+				spi_imx_push(spi_imx);
+				timedout = spi_imx->devtype_data->wait_on_transaction(spi_imx);
+				if (timedout != 0) {
+					dev_err(&spi->dev, "I/O Error in PIO\n");
+					spi_imx->devtype_data->reset(spi_imx);
+					return -ETIMEDOUT;
+				}
+			}
+		}
+		return transfer->len;
+	}
 
 	reinit_completion(&spi_imx->xfer_done);
 
@@ -1543,12 +1591,89 @@ static int spi_imx_transfer(struct spi_device *spi,
 		readl(spi_imx->base + MXC_CSPIRXDATA);
 
 	if (spi_imx->slave_mode)
-		return spi_imx_pio_transfer_slave(spi, transfer);
+		status = spi_imx_pio_transfer_slave(spi, transfer);
 
 	if (spi_imx->usedma)
-		return spi_imx_dma_transfer(spi_imx, transfer);
+		status = spi_imx_dma_transfer(spi_imx, transfer);
 	else
-		return spi_imx_pio_transfer(spi, transfer);
+		status = spi_imx_pio_transfer(spi, transfer);
+
+	if (status == transfer->len)
+		status = 0;
+
+	else if (status >= 0)
+		status = -EREMOTEIO;
+
+	return status;
+}
+
+static int spi_imx_transfer_one_message(struct spi_master *master,
+				    struct spi_message *msg)
+{
+	struct spi_transfer *xfer;
+	bool keep_cs = false;
+	int ret = 0;
+
+	ret = spi_imx_setupxfer(msg->spi, NULL);
+	if (ret < 0) {
+		dev_err(&msg->spi->dev,
+			"Transfer setup failed: %d\n", ret);
+		goto out;
+	}
+
+	spi_imx_set_cs(msg->spi, true);
+
+	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+		if (xfer->tx_buf || xfer->rx_buf) {
+			ret = spi_imx_transfer(msg->spi, xfer);
+			if (ret < 0) {
+				dev_err(&msg->spi->dev,
+					"SPI transfer failed: %d\n", ret);
+				goto out;
+			}
+
+
+		} else {
+			if (xfer->len)
+				dev_err(&msg->spi->dev,
+					"Bufferless transfer has length %u\n",
+					xfer->len);
+		}
+
+		if (msg->status != -EINPROGRESS)
+			goto out;
+
+		if (xfer->delay_usecs)
+			udelay(xfer->delay_usecs);
+
+		if (xfer->cs_change) {
+			if (list_is_last(&xfer->transfer_list,
+					 &msg->transfers)) {
+				keep_cs = true;
+			} else {
+				spi_imx_set_cs(msg->spi, false);
+				spi_imx_set_cs(msg->spi, true);
+			}
+		}
+
+		msg->actual_length += xfer->len;
+	}
+
+out:
+	if (ret != 0 || !keep_cs)
+		spi_imx_set_cs(msg->spi, false);
+
+	if (msg->status == -EINPROGRESS)
+		msg->status = ret;
+
+	if (msg->status && master->handle_err)
+		master->handle_err(master, msg);
+
+	spi_res_release(master, msg);
+
+	spi_finalize_current_message(master);
+
+	return ret;
 }
 
 static int spi_imx_setup(struct spi_device *spi)
@@ -1563,7 +1688,7 @@ static int spi_imx_setup(struct spi_device *spi)
 		gpio_direction_output(spi->cs_gpio,
 				      spi->mode & SPI_CS_HIGH ? 0 : 1);
 
-	spi_imx_chipselect(spi, BITBANG_CS_INACTIVE);
+	spi_imx_set_cs(spi, false);
 
 	return 0;
 }
@@ -1660,7 +1785,7 @@ static int spi_imx_probe(struct platform_device *pdev)
 	master->bus_num = np ? -1 : pdev->id;
 
 	spi_imx = spi_master_get_devdata(master);
-	spi_imx->bitbang.master = master;
+	spi_imx->master = master;
 	spi_imx->dev = &pdev->dev;
 	spi_imx->slave_mode = slave_mode;
 
@@ -1687,19 +1812,16 @@ static int spi_imx_probe(struct platform_device *pdev)
 		/* If not preset, default value of 1 is used */
 	}
 
-	spi_imx->bitbang.chipselect = spi_imx_chipselect;
-	spi_imx->bitbang.setup_transfer = spi_imx_setupxfer;
-	spi_imx->bitbang.txrx_bufs = spi_imx_transfer;
-	spi_imx->bitbang.master->setup = spi_imx_setup;
-	spi_imx->bitbang.master->cleanup = spi_imx_cleanup;
-	spi_imx->bitbang.master->prepare_message = spi_imx_prepare_message;
-	spi_imx->bitbang.master->unprepare_message = spi_imx_unprepare_message;
-	spi_imx->bitbang.master->slave_abort = spi_imx_slave_abort;
-	spi_imx->bitbang.master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH \
-					     | SPI_NO_CS;
+
+	spi_imx->master->transfer_one_message = spi_imx_transfer_one_message;
+	spi_imx->master->setup = spi_imx_setup;
+	spi_imx->master->cleanup = spi_imx_cleanup;
+	spi_imx->master->prepare_message = spi_imx_prepare_message;
+	spi_imx->master->unprepare_message = spi_imx_unprepare_message;
+	spi_imx->master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH;
 	if (is_imx35_cspi(spi_imx) || is_imx51_ecspi(spi_imx) ||
 	    is_imx53_ecspi(spi_imx))
-		spi_imx->bitbang.master->mode_bits |= SPI_LOOP | SPI_READY;
+		spi_imx->master->mode_bits |= SPI_LOOP;
 
 	spi_imx->spi_drctl = spi_drctl;
 
@@ -1766,11 +1888,9 @@ static int spi_imx_probe(struct platform_device *pdev)
 	spi_imx->devtype_data->intctrl(spi_imx, 0);
 
 	master->dev.of_node = pdev->dev.of_node;
-	ret = spi_bitbang_start(&spi_imx->bitbang);
-	if (ret) {
-		dev_err(&pdev->dev, "bitbang start failed with %d\n", ret);
-		goto out_clk_put;
-	}
+	ret = spi_register_master(spi_master_get(master));
+	if (ret)
+		spi_master_put(master);
 
 	/* Request GPIO CS lines, if any */
 	if (!spi_imx->slave_mode && master->cs_gpios) {
@@ -1800,7 +1920,7 @@ static int spi_imx_probe(struct platform_device *pdev)
 	return ret;
 
 out_spi_bitbang:
-	spi_bitbang_stop(&spi_imx->bitbang);
+	spi_unregister_master(spi_imx->master);
 out_clk_put:
 	clk_disable_unprepare(spi_imx->clk_ipg);
 out_put_per:
@@ -1817,7 +1937,7 @@ static int spi_imx_remove(struct platform_device *pdev)
 	struct spi_imx_data *spi_imx = spi_master_get_devdata(master);
 	int ret;
 
-	spi_bitbang_stop(&spi_imx->bitbang);
+	spi_unregister_master(spi_imx->master);
 
 	ret = clk_enable(spi_imx->clk_per);
 	if (ret)

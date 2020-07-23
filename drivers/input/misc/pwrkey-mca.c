@@ -194,6 +194,8 @@ static int mca_pwrkey_initialize(struct mca_pwrkey *pwrkey)
 
 	if (pwrkey->key_power)
 		pwrctrl0 |= MCA_PWR_KEY_OFF_EN;
+	else
+		pwrctrl0 |= MCA_PWR_OFF_CANCEL;
 
 	if (pwrkey->key_power_up)
 		pwrctrl0 |= MCA_PWR_KEY_OFF_UP_EN;
