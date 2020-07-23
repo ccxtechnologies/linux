@@ -1584,6 +1584,7 @@ static int spi_imx_pio_transfer_slave(struct spi_device *spi,
 static int spi_imx_transfer(struct spi_device *spi,
 				struct spi_transfer *transfer)
 {
+	int status;
 	struct spi_imx_data *spi_imx = spi_master_get_devdata(spi->master);
 
 	/* flush rxfifo before transfer */
@@ -1818,6 +1819,7 @@ static int spi_imx_probe(struct platform_device *pdev)
 	spi_imx->master->cleanup = spi_imx_cleanup;
 	spi_imx->master->prepare_message = spi_imx_prepare_message;
 	spi_imx->master->unprepare_message = spi_imx_unprepare_message;
+	spi_imx->master->slave_abort = spi_imx_slave_abort;
 	spi_imx->master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH;
 	if (is_imx35_cspi(spi_imx) || is_imx51_ecspi(spi_imx) ||
 	    is_imx53_ecspi(spi_imx))
